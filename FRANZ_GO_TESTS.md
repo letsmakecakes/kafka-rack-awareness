@@ -186,15 +186,15 @@ Total Duration: 31.82 seconds
 - **Better Defaults**: Idempotence enabled by default
 
 **Comparison**:
-| Feature | franz-go | segmentio/kafka-go | confluent-kafka-go |
-|---------|----------|-------------------|-------------------|
-| CGO Required | ❌ No | ❌ No | ✅ Yes (librdkafka) |
-| Performance | 🚀 Excellent | ✅ Good | 🚀 Excellent |
-| API Design | ✅ Modern | ✅ Clean | ⚠️ C-like |
-| Transactions | ✅ Full | ⚠️ Limited | ✅ Full |
-| Rack Awareness | ✅ Native | ✅ Via config | ✅ Via config |
-| Idempotence | ✅ Default on | ⚠️ Manual | ⚠️ Manual |
-| Windows Support | ✅ Native | ✅ Native | ⚠️ Requires CGO |
+| Feature         | franz-go     | segmentio/kafka-go | confluent-kafka-go |
+| --------------- | ------------ | ------------------ | ------------------ |
+| CGO Required    | ❌ No         | ❌ No               | ✅ Yes (librdkafka) |
+| Performance     | 🚀 Excellent  | ✅ Good             | 🚀 Excellent        |
+| API Design      | ✅ Modern     | ✅ Clean            | ⚠️ C-like           |
+| Transactions    | ✅ Full       | ⚠️ Limited          | ✅ Full             |
+| Rack Awareness  | ✅ Native     | ✅ Via config       | ✅ Via config       |
+| Idempotence     | ✅ Default on | ⚠️ Manual           | ⚠️ Manual           |
+| Windows Support | ✅ Native     | ✅ Native           | ⚠️ Requires CGO     |
 
 ## API Differences
 
