@@ -4,19 +4,20 @@
 [![Kafka](https://img.shields.io/badge/Kafka-7.5.0-231F20?style=flat&logo=apache-kafka)](https://kafka.apache.org/)
 [![Docker](https://img.shields.io/badge/Docker-Required-2496ED?style=flat&logo=docker)](https://www.docker.com/)
 [![KRaft](https://img.shields.io/badge/KRaft-Enabled-green?style=flat)](https://kafka.apache.org/documentation/#kraft)
-[![Tests](https://img.shields.io/badge/Tests-8%2F8%20Passing-brightgreen?style=flat)]()
+[![Tests](https://img.shields.io/badge/Tests-18%2F18%20Passing-brightgreen?style=flat)]()
 
 A comprehensive testing suite for validating **Kafka rack awareness** functionality using Go with **KRaft mode** (no Zookeeper required).
 
 ## 🎯 Features
 
-- ✅ **8 Comprehensive Tests** covering all rack awareness scenarios
+- ✅ **18 Comprehensive Tests** with two popular Go Kafka libraries
 - ✅ **KRaft Mode** - Modern Kafka without Zookeeper dependency
-- ✅ **Pure Go** - Using `segmentio/kafka-go` (no CGO required)
+- ✅ **Pure Go** - Using `segmentio/kafka-go` and `franz-go` (no CGO required)
 - ✅ **Docker-based** - Easy setup with Docker Compose
 - ✅ **100% Pass Rate** - All tests verified and passing
 - ✅ **Cross-platform** - Works on Windows, Linux, and macOS
 - ✅ **Production-ready** - Test patterns for real-world scenarios
+- ✅ **Two Libraries** - Examples with both segmentio/kafka-go and franz-go
 
 ## 📋 Quick Start
 
@@ -42,12 +43,19 @@ sleep 25
 # Install dependencies
 go mod tidy
 
-# Run all tests
+# Run all tests (both libraries)
+go test -v -timeout 5m
+
+# Run only segmentio/kafka-go tests
 go test -v -run TestPureGo -timeout 5m
+
+# Run only franz-go tests
+go test -v -run TestFranz -timeout 5m
 ```
 
 Expected output:
 ```
+segmentio/kafka-go tests:
 ✅ TestPureGo_BrokersAccessible          PASS
 ✅ TestPureGo_RackConfiguration          PASS
 ✅ TestPureGo_TopicReplicaDistribution   PASS
@@ -57,7 +65,19 @@ Expected output:
 ✅ TestPureGo_HighPartitionCount         PASS
 ✅ TestPureGo_SinglePartition            PASS
 
-PASS - 8/8 tests passed
+franz-go tests:
+✅ TestFranz_BrokerMetadata              PASS
+✅ TestFranz_ReplicaDistribution         PASS
+✅ TestFranz_ProducerWithRackAwareness   PASS
+✅ TestFranz_ConsumerWithRackAwareness   PASS
+✅ TestFranz_PartitionDistribution       PASS
+✅ TestFranz_TransactionalProducer       PASS
+✅ TestFranz_IdempotentProducer          PASS
+✅ TestFranz_ConsumerRebalance           PASS
+✅ TestFranz_ISRVerification             PASS
+✅ TestFranz_HighPartitionCount          PASS
+
+PASS - 18/18 tests passed
 ```
 
 ## 🏗️ Architecture
@@ -87,47 +107,62 @@ PASS - 8/8 tests passed
 
 ## 🧪 Test Coverage
 
-### 1. Broker Accessibility (0.03s)
-Verifies all brokers are accessible and properly configured with rack information.
+This repository includes **two complete test suites** using different Go Kafka libraries:
 
-### 2. Rack Configuration (0.01s)
-Confirms each broker is assigned to the correct rack (rack-a, rack-b, rack-c).
+### Test Suite 1: segmentio/kafka-go (8 tests, ~47s)
 
-### 3. Topic Replica Distribution (3.24s)
-Validates that **100% of partition replicas** are distributed across all available racks.
+1. **Broker Accessibility** (0.03s) - Verify all brokers accessible
+2. **Rack Configuration** (0.01s) - Confirm rack assignments
+3. **Topic Replica Distribution** (3.24s) - Validate replica placement
+4. **Producer Messages** (3.23s) - Test message production
+5. **Consumer Messages** (31.10s) - Test message consumption
+6. **Leader Distribution** (3.11s) - Verify leader balance
+7. **High Partition Count** (3.11s) - Test with 30 partitions
+8. **Single Partition** (2.12s) - Test minimal partition setup
 
-**Key Finding:** ✅ All partitions have replicas in different racks
+📄 **Detailed Results**: See [TEST_RESULTS.md](TEST_RESULTS.md)
 
-### 4. Producer Messages (3.23s)
-Tests message production to rack-aware Kafka cluster.
+### Test Suite 2: franz-go (10 tests, ~32s)
 
-### 5. Consumer Messages (31.10s)
-Tests message consumption with consumer groups and rack awareness.
+1. **Broker Metadata** (0.09s) - Verify broker metadata and racks
+2. **Replica Distribution** (3.93s) - Validate replica placement
+3. **Producer with Rack Awareness** (3.12s) - Test rack-aware production
+4. **Consumer with Rack Awareness** (2.80s) - Test rack-aware consumption
+5. **Partition Distribution** (2.18s) - Verify leader distribution
+6. **Transactional Producer** (4.51s) - Test transactions
+7. **Idempotent Producer** (2.41s) - Test idempotence
+8. **Consumer Rebalance** (7.17s) - Test rebalancing
+9. **ISR Verification** (2.18s) - Verify in-sync replicas
+10. **High Partition Count** (3.13s) - Test with 30 partitions
 
-### 6. Leader Distribution (3.11s)
-Verifies partition leaders are evenly distributed across racks.
+📄 **Detailed Results**: See [FRANZ_GO_TESTS.md](FRANZ_GO_TESTS.md)
 
-**Key Finding:** ✅ Perfect balance - each rack has equal leadership
-
-### 7. High Partition Count (3.11s)
-Tests rack awareness with 30 partitions to verify scalability.
-
-**Key Finding:** ✅ 30/30 partitions distributed across all racks
-
-### 8. Single Partition (2.12s)
-Validates rack awareness even with single-partition topics.
-
-**Key Finding:** ✅ Even 1 partition uses all 3 racks for replicas
-
-## 📊 Test Results
+## 📊 Combined Test Results
 
 ```
-Total Tests:       8
-Passed:            8 (100%)
+Total Tests:       18 (8 segmentio + 10 franz-go)
+Passed:            18 (100%)
 Failed:            0 (0%)
-Total Duration:    ~47 seconds
-Coverage:          Comprehensive
+Total Duration:    ~79 seconds
+Coverage:          Comprehensive (2 libraries)
 ```
+
+## 📚 Library Comparison
+
+| Feature | segmentio/kafka-go | franz-go |
+|---------|-------------------|----------|
+| CGO Required | ❌ No | ❌ No |
+| Performance | ✅ Good | 🚀 Excellent |
+| API Design | ✅ Clean | ✅ Modern |
+| Transactions | ⚠️ Limited | ✅ Full Support |
+| Idempotence | ⚠️ Manual | ✅ Default On |
+| Rack Awareness | ✅ Via Config | ✅ Native API |
+| Admin Operations | ⚠️ Basic | ✅ Comprehensive |
+| Windows Support | ✅ Native | ✅ Native |
+
+**Recommendation**: 
+- Use **segmentio/kafka-go** for simple use cases and straightforward API
+- Use **franz-go** for high-performance applications with advanced features
 
 ### Key Metrics
 - ✅ **100%** replica distribution across racks
