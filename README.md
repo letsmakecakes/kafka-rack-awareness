@@ -149,16 +149,16 @@ Coverage:          Comprehensive (2 libraries)
 
 ## 📚 Library Comparison
 
-| Feature | segmentio/kafka-go | franz-go |
-|---------|-------------------|----------|
-| CGO Required | ❌ No | ❌ No |
-| Performance | ✅ Good | 🚀 Excellent |
-| API Design | ✅ Clean | ✅ Modern |
-| Transactions | ⚠️ Limited | ✅ Full Support |
-| Idempotence | ⚠️ Manual | ✅ Default On |
-| Rack Awareness | ✅ Via Config | ✅ Native API |
-| Admin Operations | ⚠️ Basic | ✅ Comprehensive |
-| Windows Support | ✅ Native | ✅ Native |
+| Feature          | segmentio/kafka-go | franz-go        |
+| ---------------- | ------------------ | --------------- |
+| CGO Required     | ❌ No               | ❌ No            |
+| Performance      | ✅ Good             | 🚀 Excellent     |
+| API Design       | ✅ Clean            | ✅ Modern        |
+| Transactions     | ⚠️ Limited          | ✅ Full Support  |
+| Idempotence      | ⚠️ Manual           | ✅ Default On    |
+| Rack Awareness   | ✅ Via Config       | ✅ Native API    |
+| Admin Operations | ⚠️ Basic            | ✅ Comprehensive |
+| Windows Support  | ✅ Native           | ✅ Native        |
 
 **Recommendation**: 
 - Use **segmentio/kafka-go** for simple use cases and straightforward API
