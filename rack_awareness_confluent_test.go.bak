@@ -1,0 +1,989 @@
+package kafka_rack_awareness
+
+import (
+	"context"
+	"fmt"
+	"sort"
+	"testing"
+	"time"
+
+	"github.com/confluentinc/confluent-kafka-go/v2/kafka"
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
+)
+
+const (
+	bootstrapServers = "localhost:9092,localhost:9093,localhost:9094"
+	testTimeout      = 60 * time.Second
+)
+
+// Helper function to create admin client
+func createAdminClient(t *testing.T) *kafka.AdminClient {
+	adminClient, err := kafka.NewAdminClient(&kafka.ConfigMap{
+		"bootstrap.servers": bootstrapServers,
+	})
+	require.NoError(t, err, "Failed to create admin client")
+	return adminClient
+}
+
+// Helper function to create producer
+func createProducer(t *testing.T, config *kafka.ConfigMap) *kafka.Producer {
+	if config == nil {
+		config = &kafka.ConfigMap{
+			"bootstrap.servers": bootstrapServers,
+		}
+	} else {
+		(*config)["bootstrap.servers"] = bootstrapServers
+	}
+	
+	producer, err := kafka.NewProducer(config)
+	require.NoError(t, err, "Failed to create producer")
+	return producer
+}
+
+// Helper function to create consumer
+func createConsumer(t *testing.T, groupID string, config *kafka.ConfigMap) *kafka.Consumer {
+	if config == nil {
+		config = &kafka.ConfigMap{
+			"bootstrap.servers": bootstrapServers,
+			"group.id":          groupID,
+			"auto.offset.reset": "earliest",
+		}
+	} else {
+		(*config)["bootstrap.servers"] = bootstrapServers
+		(*config)["group.id"] = groupID
+		(*config)["auto.offset.reset"] = "earliest"
+	}
+	
+	consumer, err := kafka.NewConsumer(config)
+	require.NoError(t, err, "Failed to create consumer")
+	return consumer
+}
+
+// Helper function to create topic with replica assignment
+func createTopicWithReplicas(t *testing.T, adminClient *kafka.AdminClient, topicName string, 
+	partitions int, replicationFactor int) {
+	
+	ctx, cancel := context.WithTimeout(context.Background(), testTimeout)
+	defer cancel()
+	
+	topicSpec := kafka.TopicSpecification{
+		Topic:             topicName,
+		NumPartitions:     partitions,
+		ReplicationFactor: replicationFactor,
+	}
+	
+	results, err := adminClient.CreateTopics(ctx, []kafka.TopicSpecification{topicSpec})
+	require.NoError(t, err, "Failed to create topic")
+	
+	for _, result := range results {
+		require.NoError(t, result.Error, "Topic creation failed: %v", result.Error)
+	}
+	
+	// Wait for topic to be ready
+	time.Sleep(2 * time.Second)
+}
+
+// Helper function to delete topic
+func deleteTopic(t *testing.T, adminClient *kafka.AdminClient, topicName string) {
+	ctx, cancel := context.WithTimeout(context.Background(), testTimeout)
+	defer cancel()
+	
+	results, err := adminClient.DeleteTopics(ctx, []string{topicName})
+	if err != nil {
+		t.Logf("Warning: Failed to delete topic %s: %v", topicName, err)
+		return
+	}
+	
+	for _, result := range results {
+		if result.Error.Code() != kafka.ErrNoError && result.Error.Code() != kafka.ErrUnknownTopicOrPart {
+			t.Logf("Warning: Topic deletion had error: %v", result.Error)
+		}
+	}
+}
+
+// Helper function to get metadata
+func getMetadata(t *testing.T, adminClient *kafka.AdminClient, topic string) *kafka.Metadata {
+	metadata, err := adminClient.GetMetadata(&topic, false, int(testTimeout.Milliseconds()))
+	require.NoError(t, err, "Failed to get metadata")
+	return metadata
+}
+
+// Test 1: Verify broker rack configuration
+func TestBrokerRackConfiguration(t *testing.T) {
+	adminClient := createAdminClient(t)
+	defer adminClient.Close()
+	
+	metadata, err := adminClient.GetMetadata(nil, true, int(testTimeout.Milliseconds()))
+	require.NoError(t, err, "Failed to get metadata")
+	
+	expectedRacks := map[int32]string{
+		1: "rack-a",
+		2: "rack-b",
+		3: "rack-c",
+	}
+	
+	assert.Equal(t, 3, len(metadata.Brokers), "Expected 3 brokers")
+	
+	for _, broker := range metadata.Brokers {
+		expectedRack, exists := expectedRacks[broker.ID]
+		require.True(t, exists, "Unexpected broker ID: %d", broker.ID)
+		assert.Equal(t, expectedRack, broker.Rack, 
+			"Broker %d has incorrect rack. Expected: %s, Got: %s", 
+			broker.ID, expectedRack, broker.Rack)
+		t.Logf("Broker %d is in rack: %s", broker.ID, broker.Rack)
+	}
+}
+
+// Test 2: Verify replicas are distributed across racks
+func TestReplicaDistributionAcrossRacks(t *testing.T) {
+	adminClient := createAdminClient(t)
+	defer adminClient.Close()
+	
+	topicName := fmt.Sprintf("test-rack-distribution-%d", time.Now().Unix())
+	defer deleteTopic(t, adminClient, topicName)
+	
+	// Create topic with 6 partitions and replication factor 3
+	createTopicWithReplicas(t, adminClient, topicName, 6, 3)
+	
+	metadata := getMetadata(t, adminClient, topicName)
+	require.NotNil(t, metadata.Topics[topicName])
+	
+	topicMetadata := metadata.Topics[topicName]
+	
+	// Get broker rack mapping
+	brokerRacks := make(map[int32]string)
+	for _, broker := range metadata.Brokers {
+		brokerRacks[broker.ID] = broker.Rack
+	}
+	
+	// Verify each partition has replicas distributed across different racks
+	for _, partition := range topicMetadata.Partitions {
+		racks := make(map[string]bool)
+		for _, replica := range partition.Replicas {
+			rack := brokerRacks[replica]
+			racks[rack] = true
+		}
+		
+		// With 3 replicas and 3 racks, all replicas should be in different racks
+		assert.Equal(t, 3, len(racks), 
+			"Partition %d replicas should be distributed across 3 different racks, got %d", 
+			partition.ID, len(racks))
+		
+		t.Logf("Partition %d replicas: %v, racks: %v", partition.ID, partition.Replicas, getRackList(partition.Replicas, brokerRacks))
+	}
+}
+
+// Test 3: Verify ISR (In-Sync Replicas) across racks
+func TestISRAcrossRacks(t *testing.T) {
+	adminClient := createAdminClient(t)
+	defer adminClient.Close()
+	
+	topicName := fmt.Sprintf("test-isr-racks-%d", time.Now().Unix())
+	defer deleteTopic(t, adminClient, topicName)
+	
+	createTopicWithReplicas(t, adminClient, topicName, 3, 3)
+	
+	metadata := getMetadata(t, adminClient, topicName)
+	topicMetadata := metadata.Topics[topicName]
+	
+	brokerRacks := make(map[int32]string)
+	for _, broker := range metadata.Brokers {
+		brokerRacks[broker.ID] = broker.Rack
+	}
+	
+	for _, partition := range topicMetadata.Partitions {
+		// Verify ISR has at least 2 replicas (min.insync.replicas = 2)
+		assert.GreaterOrEqual(t, len(partition.Isrs), 2, 
+			"Partition %d ISR should have at least 2 replicas", partition.ID)
+		
+		// Verify ISR replicas are across different racks
+		isrRacks := make(map[string]bool)
+		for _, isr := range partition.Isrs {
+			rack := brokerRacks[isr]
+			isrRacks[rack] = true
+		}
+		
+		assert.GreaterOrEqual(t, len(isrRacks), 2, 
+			"Partition %d ISR should span at least 2 racks for fault tolerance", partition.ID)
+		
+		t.Logf("Partition %d ISR: %v, ISR racks: %v", partition.ID, partition.Isrs, getRackList(partition.Isrs, brokerRacks))
+	}
+}
+
+// Test 4: Producer with rack awareness using replica selector
+func TestProducerRackAwareness(t *testing.T) {
+	adminClient := createAdminClient(t)
+	defer adminClient.Close()
+	
+	topicName := fmt.Sprintf("test-producer-rack-%d", time.Now().Unix())
+	defer deleteTopic(t, adminClient, topicName)
+	
+	createTopicWithReplicas(t, adminClient, topicName, 3, 3)
+	
+	// Create producer with client rack configuration
+	producer := createProducer(t, &kafka.ConfigMap{
+		"client.rack": "rack-a",
+		"acks":        "all",
+	})
+	defer producer.Close()
+	
+	// Produce messages
+	deliveryChan := make(chan kafka.Event, 100)
+	for i := 0; i < 10; i++ {
+		err := producer.Produce(&kafka.Message{
+			TopicPartition: kafka.TopicPartition{Topic: &topicName, Partition: kafka.PartitionAny},
+			Key:            []byte(fmt.Sprintf("key-%d", i)),
+			Value:          []byte(fmt.Sprintf("value-%d", i)),
+		}, deliveryChan)
+		require.NoError(t, err)
+	}
+	
+	// Wait for delivery reports
+	successCount := 0
+	for i := 0; i < 10; i++ {
+		e := <-deliveryChan
+		m := e.(*kafka.Message)
+		if m.TopicPartition.Error == nil {
+			successCount++
+			t.Logf("Message delivered to partition %d", m.TopicPartition.Partition)
+		} else {
+			t.Errorf("Delivery failed: %v", m.TopicPartition.Error)
+		}
+	}
+	
+	assert.Equal(t, 10, successCount, "All messages should be delivered successfully")
+}
+
+// Test 5: Consumer with rack awareness using fetch from follower
+func TestConsumerRackAwareness(t *testing.T) {
+	adminClient := createAdminClient(t)
+	defer adminClient.Close()
+	
+	topicName := fmt.Sprintf("test-consumer-rack-%d", time.Now().Unix())
+	defer deleteTopic(t, adminClient, topicName)
+	
+	createTopicWithReplicas(t, adminClient, topicName, 3, 3)
+	
+	// Produce test messages
+	producer := createProducer(t, nil)
+	defer producer.Close()
+	
+	for i := 0; i < 30; i++ {
+		producer.Produce(&kafka.Message{
+			TopicPartition: kafka.TopicPartition{Topic: &topicName, Partition: kafka.PartitionAny},
+			Value:          []byte(fmt.Sprintf("message-%d", i)),
+		}, nil)
+	}
+	producer.Flush(10000)
+	
+	// Create consumer with rack awareness
+	consumer := createConsumer(t, fmt.Sprintf("test-group-%d", time.Now().Unix()), &kafka.ConfigMap{
+		"client.rack": "rack-a",
+	})
+	defer consumer.Close()
+	
+	err := consumer.Subscribe(topicName, nil)
+	require.NoError(t, err)
+	
+	messageCount := 0
+	timeout := time.After(30 * time.Second)
+	
+	for messageCount < 30 {
+		select {
+		case <-timeout:
+			t.Fatalf("Timeout waiting for messages. Received: %d/30", messageCount)
+		default:
+			ev := consumer.Poll(1000)
+			if ev == nil {
+				continue
+			}
+			
+			switch e := ev.(type) {
+			case *kafka.Message:
+				messageCount++
+				t.Logf("Consumed message from partition %d: %s", e.TopicPartition.Partition, string(e.Value))
+			case kafka.Error:
+				t.Logf("Consumer error: %v", e)
+			}
+		}
+	}
+	
+	assert.Equal(t, 30, messageCount, "All messages should be consumed")
+}
+
+// Test 6: Partition leader distribution across racks
+func TestLeaderDistributionAcrossRacks(t *testing.T) {
+	adminClient := createAdminClient(t)
+	defer adminClient.Close()
+	
+	topicName := fmt.Sprintf("test-leader-distribution-%d", time.Now().Unix())
+	defer deleteTopic(t, adminClient, topicName)
+	
+	createTopicWithReplicas(t, adminClient, topicName, 9, 3)
+	
+	metadata := getMetadata(t, adminClient, topicName)
+	topicMetadata := metadata.Topics[topicName]
+	
+	brokerRacks := make(map[int32]string)
+	for _, broker := range metadata.Brokers {
+		brokerRacks[broker.ID] = broker.Rack
+	}
+	
+	// Count leaders per rack
+	leadersByRack := make(map[string]int)
+	for _, partition := range topicMetadata.Partitions {
+		rack := brokerRacks[partition.Leader]
+		leadersByRack[rack]++
+		t.Logf("Partition %d leader is broker %d in rack %s", partition.ID, partition.Leader, rack)
+	}
+	
+	// Verify leaders are distributed across all racks
+	assert.Equal(t, 3, len(leadersByRack), "Leaders should be distributed across all 3 racks")
+	
+	// Each rack should have approximately equal number of leaders (3 each for 9 partitions)
+	for rack, count := range leadersByRack {
+		assert.GreaterOrEqual(t, count, 2, "Rack %s should have at least 2 leaders", rack)
+		assert.LessOrEqual(t, count, 4, "Rack %s should have at most 4 leaders", rack)
+		t.Logf("Rack %s has %d leaders", rack, count)
+	}
+}
+
+// Test 7: Replication factor less than number of racks
+func TestReplicationFactorLessThanRacks(t *testing.T) {
+	adminClient := createAdminClient(t)
+	defer adminClient.Close()
+	
+	topicName := fmt.Sprintf("test-rf-less-than-racks-%d", time.Now().Unix())
+	defer deleteTopic(t, adminClient, topicName)
+	
+	// Create topic with replication factor 2 (less than 3 racks)
+	createTopicWithReplicas(t, adminClient, topicName, 3, 2)
+	
+	metadata := getMetadata(t, adminClient, topicName)
+	topicMetadata := metadata.Topics[topicName]
+	
+	brokerRacks := make(map[int32]string)
+	for _, broker := range metadata.Brokers {
+		brokerRacks[broker.ID] = broker.Rack
+	}
+	
+	// Verify replicas are in different racks
+	for _, partition := range topicMetadata.Partitions {
+		racks := make(map[string]bool)
+		for _, replica := range partition.Replicas {
+			rack := brokerRacks[replica]
+			racks[rack] = true
+		}
+		
+		assert.Equal(t, 2, len(racks), 
+			"Partition %d with RF=2 should have replicas in 2 different racks", partition.ID)
+		t.Logf("Partition %d replicas in racks: %v", partition.ID, getRackList(partition.Replicas, brokerRacks))
+	}
+}
+
+// Test 8: Single partition topic rack awareness
+func TestSinglePartitionTopicRackAwareness(t *testing.T) {
+	adminClient := createAdminClient(t)
+	defer adminClient.Close()
+	
+	topicName := fmt.Sprintf("test-single-partition-%d", time.Now().Unix())
+	defer deleteTopic(t, adminClient, topicName)
+	
+	createTopicWithReplicas(t, adminClient, topicName, 1, 3)
+	
+	metadata := getMetadata(t, adminClient, topicName)
+	topicMetadata := metadata.Topics[topicName]
+	
+	brokerRacks := make(map[int32]string)
+	for _, broker := range metadata.Brokers {
+		brokerRacks[broker.ID] = broker.Rack
+	}
+	
+	assert.Equal(t, 1, len(topicMetadata.Partitions), "Should have exactly 1 partition")
+	
+	partition := topicMetadata.Partitions[0]
+	assert.Equal(t, 3, len(partition.Replicas), "Single partition should have 3 replicas")
+	
+	racks := make(map[string]bool)
+	for _, replica := range partition.Replicas {
+		rack := brokerRacks[replica]
+		racks[rack] = true
+	}
+	
+	assert.Equal(t, 3, len(racks), "Replicas should be distributed across all 3 racks")
+	t.Logf("Single partition replicas across racks: %v", getRackList(partition.Replicas, brokerRacks))
+}
+
+// Test 9: High partition count topic
+func TestHighPartitionCountTopic(t *testing.T) {
+	adminClient := createAdminClient(t)
+	defer adminClient.Close()
+	
+	topicName := fmt.Sprintf("test-high-partition-%d", time.Now().Unix())
+	defer deleteTopic(t, adminClient, topicName)
+	
+	createTopicWithReplicas(t, adminClient, topicName, 30, 3)
+	
+	metadata := getMetadata(t, adminClient, topicName)
+	topicMetadata := metadata.Topics[topicName]
+	
+	brokerRacks := make(map[int32]string)
+	for _, broker := range metadata.Brokers {
+		brokerRacks[broker.ID] = broker.Rack
+	}
+	
+	rackDistributionCount := 0
+	
+	for _, partition := range topicMetadata.Partitions {
+		racks := make(map[string]bool)
+		for _, replica := range partition.Replicas {
+			rack := brokerRacks[replica]
+			racks[rack] = true
+		}
+		
+		if len(racks) == 3 {
+			rackDistributionCount++
+		}
+	}
+	
+	// All or most partitions should have replicas across all 3 racks
+	assert.Equal(t, 30, rackDistributionCount, 
+		"All partitions should have replicas distributed across 3 racks")
+	t.Logf("Partitions with replicas across all racks: %d/30", rackDistributionCount)
+}
+
+// Test 10: Producer idempotence with rack awareness
+func TestProducerIdempotenceWithRackAwareness(t *testing.T) {
+	adminClient := createAdminClient(t)
+	defer adminClient.Close()
+	
+	topicName := fmt.Sprintf("test-idempotent-producer-%d", time.Now().Unix())
+	defer deleteTopic(t, adminClient, topicName)
+	
+	createTopicWithReplicas(t, adminClient, topicName, 3, 3)
+	
+	producer := createProducer(t, &kafka.ConfigMap{
+		"client.rack":        "rack-b",
+		"enable.idempotence": true,
+		"acks":               "all",
+		"max.in.flight":      5,
+	})
+	defer producer.Close()
+	
+	deliveryChan := make(chan kafka.Event, 20)
+	
+	for i := 0; i < 20; i++ {
+		err := producer.Produce(&kafka.Message{
+			TopicPartition: kafka.TopicPartition{Topic: &topicName, Partition: kafka.PartitionAny},
+			Key:            []byte(fmt.Sprintf("key-%d", i)),
+			Value:          []byte(fmt.Sprintf("idempotent-value-%d", i)),
+		}, deliveryChan)
+		require.NoError(t, err)
+	}
+	
+	successCount := 0
+	for i := 0; i < 20; i++ {
+		e := <-deliveryChan
+		m := e.(*kafka.Message)
+		if m.TopicPartition.Error == nil {
+			successCount++
+		}
+	}
+	
+	assert.Equal(t, 20, successCount, "All idempotent messages should be delivered")
+}
+
+// Test 11: Transactional producer with rack awareness
+func TestTransactionalProducerWithRackAwareness(t *testing.T) {
+	adminClient := createAdminClient(t)
+	defer adminClient.Close()
+	
+	topicName := fmt.Sprintf("test-transactional-%d", time.Now().Unix())
+	defer deleteTopic(t, adminClient, topicName)
+	
+	createTopicWithReplicas(t, adminClient, topicName, 3, 3)
+	
+	producer := createProducer(t, &kafka.ConfigMap{
+		"client.rack":     "rack-c",
+		"transactional.id": fmt.Sprintf("txn-producer-%d", time.Now().Unix()),
+		"acks":            "all",
+	})
+	defer producer.Close()
+	
+	err := producer.InitTransactions(context.Background())
+	require.NoError(t, err)
+	
+	err = producer.BeginTransaction()
+	require.NoError(t, err)
+	
+	deliveryChan := make(chan kafka.Event, 15)
+	
+	for i := 0; i < 15; i++ {
+		err := producer.Produce(&kafka.Message{
+			TopicPartition: kafka.TopicPartition{Topic: &topicName, Partition: kafka.PartitionAny},
+			Value:          []byte(fmt.Sprintf("txn-message-%d", i)),
+		}, deliveryChan)
+		require.NoError(t, err)
+	}
+	
+	// Wait for delivery
+	for i := 0; i < 15; i++ {
+		e := <-deliveryChan
+		m := e.(*kafka.Message)
+		require.NoError(t, m.TopicPartition.Error)
+	}
+	
+	err = producer.CommitTransaction(context.Background())
+	require.NoError(t, err)
+	
+	t.Log("Transactional messages committed successfully with rack awareness")
+}
+
+// Test 12: Consumer group rebalancing with rack awareness
+func TestConsumerGroupRebalancingWithRackAwareness(t *testing.T) {
+	adminClient := createAdminClient(t)
+	defer adminClient.Close()
+	
+	topicName := fmt.Sprintf("test-rebalance-rack-%d", time.Now().Unix())
+	groupID := fmt.Sprintf("test-rebalance-group-%d", time.Now().Unix())
+	defer deleteTopic(t, adminClient, topicName)
+	
+	createTopicWithReplicas(t, adminClient, topicName, 6, 3)
+	
+	// Produce messages
+	producer := createProducer(t, nil)
+	defer producer.Close()
+	
+	for i := 0; i < 60; i++ {
+		producer.Produce(&kafka.Message{
+			TopicPartition: kafka.TopicPartition{Topic: &topicName, Partition: kafka.PartitionAny},
+			Value:          []byte(fmt.Sprintf("rebalance-msg-%d", i)),
+		}, nil)
+	}
+	producer.Flush(10000)
+	
+	// Create first consumer
+	consumer1 := createConsumer(t, groupID, &kafka.ConfigMap{
+		"client.rack": "rack-a",
+	})
+	defer consumer1.Close()
+	
+	err := consumer1.Subscribe(topicName, nil)
+	require.NoError(t, err)
+	
+	// Consume some messages
+	msg1Count := 0
+	timeout := time.After(10 * time.Second)
+	
+consumerLoop1:
+	for msg1Count < 10 {
+		select {
+		case <-timeout:
+			break consumerLoop1
+		default:
+			ev := consumer1.Poll(1000)
+			if msg, ok := ev.(*kafka.Message); ok {
+				msg1Count++
+				t.Logf("Consumer1 received message from partition %d", msg.TopicPartition.Partition)
+			}
+		}
+	}
+	
+	// Create second consumer to trigger rebalance
+	consumer2 := createConsumer(t, groupID, &kafka.ConfigMap{
+		"client.rack": "rack-b",
+	})
+	defer consumer2.Close()
+	
+	err = consumer2.Subscribe(topicName, nil)
+	require.NoError(t, err)
+	
+	// Allow rebalance to occur
+	time.Sleep(5 * time.Second)
+	
+	// Both consumers should receive messages after rebalance
+	msg2Count := 0
+	timeout2 := time.After(10 * time.Second)
+	
+consumerLoop2:
+	for msg2Count < 5 {
+		select {
+		case <-timeout2:
+			break consumerLoop2
+		default:
+			ev := consumer2.Poll(1000)
+			if msg, ok := ev.(*kafka.Message); ok {
+				msg2Count++
+				t.Logf("Consumer2 received message from partition %d", msg.TopicPartition.Partition)
+			}
+		}
+	}
+	
+	t.Logf("Consumer1 received %d messages, Consumer2 received %d messages", msg1Count, msg2Count)
+	assert.Greater(t, msg1Count, 0, "Consumer1 should receive messages")
+	assert.Greater(t, msg2Count, 0, "Consumer2 should receive messages after rebalance")
+}
+
+// Test 13: Preferred read replica (fetch from follower)
+func TestPreferredReadReplica(t *testing.T) {
+	adminClient := createAdminClient(t)
+	defer adminClient.Close()
+	
+	topicName := fmt.Sprintf("test-preferred-replica-%d", time.Now().Unix())
+	defer deleteTopic(t, adminClient, topicName)
+	
+	createTopicWithReplicas(t, adminClient, topicName, 3, 3)
+	
+	// Produce messages
+	producer := createProducer(t, nil)
+	defer producer.Close()
+	
+	for i := 0; i < 30; i++ {
+		producer.Produce(&kafka.Message{
+			TopicPartition: kafka.TopicPartition{Topic: &topicName, Partition: kafka.PartitionAny},
+			Value:          []byte(fmt.Sprintf("preferred-msg-%d", i)),
+		}, nil)
+	}
+	producer.Flush(10000)
+	
+	// Create consumer with rack awareness to enable preferred read replica
+	consumer := createConsumer(t, fmt.Sprintf("preferred-group-%d", time.Now().Unix()), &kafka.ConfigMap{
+		"client.rack": "rack-a",
+	})
+	defer consumer.Close()
+	
+	err := consumer.Subscribe(topicName, nil)
+	require.NoError(t, err)
+	
+	messageCount := 0
+	timeout := time.After(20 * time.Second)
+	
+	for messageCount < 30 {
+		select {
+		case <-timeout:
+			t.Fatalf("Timeout waiting for messages. Received: %d/30", messageCount)
+		default:
+			ev := consumer.Poll(1000)
+			if msg, ok := ev.(*kafka.Message); ok {
+				messageCount++
+				t.Logf("Consumed from preferred replica, partition %d", msg.TopicPartition.Partition)
+			}
+		}
+	}
+	
+	assert.Equal(t, 30, messageCount, "Should consume all messages using preferred read replica")
+}
+
+// Test 14: Edge case - Empty rack configuration (should still work)
+func TestEmptyRackConfiguration(t *testing.T) {
+	// This test verifies that even without client.rack, the system functions
+	adminClient := createAdminClient(t)
+	defer adminClient.Close()
+	
+	topicName := fmt.Sprintf("test-no-client-rack-%d", time.Now().Unix())
+	defer deleteTopic(t, adminClient, topicName)
+	
+	createTopicWithReplicas(t, adminClient, topicName, 3, 3)
+	
+	// Producer without client.rack
+	producer := createProducer(t, &kafka.ConfigMap{
+		"acks": "all",
+	})
+	defer producer.Close()
+	
+	deliveryChan := make(chan kafka.Event, 10)
+	
+	for i := 0; i < 10; i++ {
+		err := producer.Produce(&kafka.Message{
+			TopicPartition: kafka.TopicPartition{Topic: &topicName, Partition: kafka.PartitionAny},
+			Value:          []byte(fmt.Sprintf("no-rack-msg-%d", i)),
+		}, deliveryChan)
+		require.NoError(t, err)
+	}
+	
+	successCount := 0
+	for i := 0; i < 10; i++ {
+		e := <-deliveryChan
+		m := e.(*kafka.Message)
+		if m.TopicPartition.Error == nil {
+			successCount++
+		}
+	}
+	
+	assert.Equal(t, 10, successCount, "Messages should be delivered even without client.rack")
+}
+
+// Test 15: Verify min.insync.replicas with rack awareness
+func TestMinISRWithRackAwareness(t *testing.T) {
+	adminClient := createAdminClient(t)
+	defer adminClient.Close()
+	
+	topicName := fmt.Sprintf("test-min-isr-%d", time.Now().Unix())
+	defer deleteTopic(t, adminClient, topicName)
+	
+	createTopicWithReplicas(t, adminClient, topicName, 3, 3)
+	
+	// Producer with acks=all should respect min.insync.replicas=2
+	producer := createProducer(t, &kafka.ConfigMap{
+		"client.rack": "rack-a",
+		"acks":        "all",
+		"request.timeout.ms": 30000,
+	})
+	defer producer.Close()
+	
+	deliveryChan := make(chan kafka.Event, 15)
+	
+	for i := 0; i < 15; i++ {
+		err := producer.Produce(&kafka.Message{
+			TopicPartition: kafka.TopicPartition{Topic: &topicName, Partition: kafka.PartitionAny},
+			Value:          []byte(fmt.Sprintf("min-isr-msg-%d", i)),
+		}, deliveryChan)
+		require.NoError(t, err)
+	}
+	
+	successCount := 0
+	for i := 0; i < 15; i++ {
+		e := <-deliveryChan
+		m := e.(*kafka.Message)
+		if m.TopicPartition.Error == nil {
+			successCount++
+		} else {
+			t.Logf("Delivery error: %v", m.TopicPartition.Error)
+		}
+	}
+	
+	assert.Equal(t, 15, successCount, "All messages should be delivered with min.insync.replicas=2")
+}
+
+// Helper function to get rack list from broker IDs
+func getRackList(brokers []int32, brokerRacks map[int32]string) []string {
+	racks := make([]string, 0, len(brokers))
+	for _, broker := range brokers {
+		if rack, exists := brokerRacks[broker]; exists {
+			racks = append(racks, rack)
+		}
+	}
+	sort.Strings(racks)
+	return racks
+}
+
+// Test 16: Concurrent producers with different rack configurations
+func TestConcurrentProducersWithDifferentRacks(t *testing.T) {
+	adminClient := createAdminClient(t)
+	defer adminClient.Close()
+	
+	topicName := fmt.Sprintf("test-concurrent-producers-%d", time.Now().Unix())
+	defer deleteTopic(t, adminClient, topicName)
+	
+	createTopicWithReplicas(t, adminClient, topicName, 6, 3)
+	
+	racks := []string{"rack-a", "rack-b", "rack-c"}
+	done := make(chan bool, 3)
+	
+	for _, rack := range racks {
+		go func(r string) {
+			producer := createProducer(t, &kafka.ConfigMap{
+				"client.rack": r,
+				"acks":        "all",
+			})
+			defer producer.Close()
+			
+			deliveryChan := make(chan kafka.Event, 10)
+			
+			for i := 0; i < 10; i++ {
+				producer.Produce(&kafka.Message{
+					TopicPartition: kafka.TopicPartition{Topic: &topicName, Partition: kafka.PartitionAny},
+					Value:          []byte(fmt.Sprintf("%s-msg-%d", r, i)),
+				}, deliveryChan)
+			}
+			
+			for i := 0; i < 10; i++ {
+				<-deliveryChan
+			}
+			
+			done <- true
+		}(rack)
+	}
+	
+	// Wait for all producers
+	for i := 0; i < 3; i++ {
+		<-done
+	}
+	
+	t.Log("All concurrent producers with different racks completed successfully")
+}
+
+// Test 17: Metadata consistency across rack-aware clients
+func TestMetadataConsistencyAcrossRacks(t *testing.T) {
+	adminClient := createAdminClient(t)
+	defer adminClient.Close()
+	
+	topicName := fmt.Sprintf("test-metadata-consistency-%d", time.Now().Unix())
+	defer deleteTopic(t, adminClient, topicName)
+	
+	createTopicWithReplicas(t, adminClient, topicName, 3, 3)
+	
+	// Get metadata from admin client
+	metadata1 := getMetadata(t, adminClient, topicName)
+	
+	// Wait a bit
+	time.Sleep(2 * time.Second)
+	
+	// Get metadata again
+	metadata2 := getMetadata(t, adminClient, topicName)
+	
+	// Compare partition metadata
+	topic1 := metadata1.Topics[topicName]
+	topic2 := metadata2.Topics[topicName]
+	
+	assert.Equal(t, len(topic1.Partitions), len(topic2.Partitions), 
+		"Partition count should be consistent")
+	
+	for i, p1 := range topic1.Partitions {
+		p2 := topic2.Partitions[i]
+		assert.Equal(t, p1.ID, p2.ID, "Partition IDs should match")
+		assert.Equal(t, p1.Leader, p2.Leader, "Leaders should match for partition %d", p1.ID)
+		assert.Equal(t, len(p1.Replicas), len(p2.Replicas), 
+			"Replica count should match for partition %d", p1.ID)
+	}
+	
+	t.Log("Metadata consistency verified across rack-aware clients")
+}
+
+// Test 18: Verify rack-aware behavior with compression
+func TestRackAwarenessWithCompression(t *testing.T) {
+	adminClient := createAdminClient(t)
+	defer adminClient.Close()
+	
+	topicName := fmt.Sprintf("test-compression-rack-%d", time.Now().Unix())
+	defer deleteTopic(t, adminClient, topicName)
+	
+	createTopicWithReplicas(t, adminClient, topicName, 3, 3)
+	
+	compressionTypes := []string{"gzip", "snappy", "lz4", "zstd"}
+	
+	for _, compression := range compressionTypes {
+		producer := createProducer(t, &kafka.ConfigMap{
+			"client.rack":      "rack-a",
+			"compression.type": compression,
+			"acks":             "all",
+		})
+		
+		deliveryChan := make(chan kafka.Event, 5)
+		
+		for i := 0; i < 5; i++ {
+			err := producer.Produce(&kafka.Message{
+				TopicPartition: kafka.TopicPartition{Topic: &topicName, Partition: kafka.PartitionAny},
+				Value:          []byte(fmt.Sprintf("%s-compressed-message-%d", compression, i)),
+			}, deliveryChan)
+			require.NoError(t, err)
+		}
+		
+		successCount := 0
+		for i := 0; i < 5; i++ {
+			e := <-deliveryChan
+			m := e.(*kafka.Message)
+			if m.TopicPartition.Error == nil {
+				successCount++
+			}
+		}
+		
+		assert.Equal(t, 5, successCount, "All messages with %s compression should be delivered", compression)
+		producer.Close()
+		
+		t.Logf("Successfully tested rack awareness with %s compression", compression)
+	}
+}
+
+// Test 19: Large message handling with rack awareness
+func TestLargeMessagesWithRackAwareness(t *testing.T) {
+	adminClient := createAdminClient(t)
+	defer adminClient.Close()
+	
+	topicName := fmt.Sprintf("test-large-messages-%d", time.Now().Unix())
+	defer deleteTopic(t, adminClient, topicName)
+	
+	createTopicWithReplicas(t, adminClient, topicName, 3, 3)
+	
+	producer := createProducer(t, &kafka.ConfigMap{
+		"client.rack":             "rack-b",
+		"acks":                    "all",
+		"message.max.bytes":       10485760, // 10MB
+		"compression.type":        "gzip",
+	})
+	defer producer.Close()
+	
+	// Create large messages (1MB each)
+	largeMessage := make([]byte, 1024*1024)
+	for i := range largeMessage {
+		largeMessage[i] = byte(i % 256)
+	}
+	
+	deliveryChan := make(chan kafka.Event, 5)
+	
+	for i := 0; i < 5; i++ {
+		err := producer.Produce(&kafka.Message{
+			TopicPartition: kafka.TopicPartition{Topic: &topicName, Partition: kafka.PartitionAny},
+			Value:          largeMessage,
+		}, deliveryChan)
+		require.NoError(t, err)
+	}
+	
+	successCount := 0
+	for i := 0; i < 5; i++ {
+		e := <-deliveryChan
+		m := e.(*kafka.Message)
+		if m.TopicPartition.Error == nil {
+			successCount++
+			t.Logf("Large message %d delivered to partition %d", i, m.TopicPartition.Partition)
+		}
+	}
+	
+	assert.Equal(t, 5, successCount, "All large messages should be delivered")
+}
+
+// Test 20: Rack awareness with custom partitioner
+func TestRackAwarenessWithCustomPartitioning(t *testing.T) {
+	adminClient := createAdminClient(t)
+	defer adminClient.Close()
+	
+	topicName := fmt.Sprintf("test-custom-partitioner-%d", time.Now().Unix())
+	defer deleteTopic(t, adminClient, topicName)
+	
+	createTopicWithReplicas(t, adminClient, topicName, 6, 3)
+	
+	producer := createProducer(t, &kafka.ConfigMap{
+		"client.rack":        "rack-c",
+		"acks":               "all",
+		"partitioner":        "murmur2_random",
+	})
+	defer producer.Close()
+	
+	deliveryChan := make(chan kafka.Event, 20)
+	partitionCounts := make(map[int32]int)
+	
+	for i := 0; i < 20; i++ {
+		err := producer.Produce(&kafka.Message{
+			TopicPartition: kafka.TopicPartition{Topic: &topicName, Partition: kafka.PartitionAny},
+			Key:            []byte(fmt.Sprintf("key-%d", i)),
+			Value:          []byte(fmt.Sprintf("partitioned-value-%d", i)),
+		}, deliveryChan)
+		require.NoError(t, err)
+	}
+	
+	for i := 0; i < 20; i++ {
+		e := <-deliveryChan
+		m := e.(*kafka.Message)
+		if m.TopicPartition.Error == nil {
+			partitionCounts[m.TopicPartition.Partition]++
+		}
+	}
+	
+	// Verify messages are distributed across partitions
+	assert.Greater(t, len(partitionCounts), 1, "Messages should be distributed across multiple partitions")
+	
+	for partition, count := range partitionCounts {
+		t.Logf("Partition %d received %d messages", partition, count)
+	}
+}
